@@ -1,0 +1,37 @@
+# Bの走行終了後に mission.py を起動する。相対パスはこの設定ファイル基準。
+use_sim_time: false
+frame_id: map
+route_dir: routes
+initial_goal_file: goal.yaml
+# 同じフォルダ内にある分岐用ファイルを明示対応。名前/番号のソートには依存しない。
+routes:
+  a: a.yaml
+  b: b.yaml
+  c: c.yaml
+  d: d.yaml
+image_dir: ~/box_mission_images
+hooks_file: box_hooks.py
+camera:
+  device: /dev/video0
+  width: 1280
+  height: 720
+  warmup_frames: 10
+ocr:
+  # Florence2環境のPython。ROS側とは別プロセスで起動。
+  python: ~/florence2_work/.venv/bin/python
+  script: ~/florence2_work/florence2_ocr.py
+  device: auto
+  # 空ならflorence2_ocr.pyのデフォルトモデルを使用。
+  model: ''
+  timeout: 300.0
+follow_action: /follow_waypoints
+navigate_action: /navigate_to_pose
+spin_action: /spin
+next_file_service: /waypoint_sender_node/next_file
+costmap_nodes:
+  - /local_costmap/local_costmap
+  - /global_costmap/global_costmap
+settle_seconds: 0.5
+spin_time_allowance: 45.0
+service_timeout: 10.0
+cancel_timeout: 15.0
