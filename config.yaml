@@ -1,9 +1,8 @@
-# Bの走行終了後に mission.py を起動する。相対パスはこの設定ファイル基準。
-use_sim_time: false
+# Gazebo用の既定設定。実機ではREADMEのカメラ校正・寸法を変更。
+use_sim_time: true
 frame_id: map
-route_dir: routes
+route_dir: routes_field
 initial_goal_file: goal.yaml
-# 同じフォルダ内にある分岐用ファイルを明示対応。名前/番号のソートには依存しない。
 routes:
   a: a.yaml
   b: b.yaml
@@ -16,12 +15,26 @@ camera:
   width: 1280
   height: 720
   warmup_frames: 10
+  source: ros
+  image_topic: /camera/image_raw
+  info_topic: /camera/camera_info
+  timeout: 10.0
+  pitch_rad: 0.0
+  yaw_rad: 0.0
+  roll_rad: 0.0
+  lateral_m: 0.0
+  mirrored: false
+  intrinsics:
+    width: 1280
+    height: 720
+    fx: 913.999
+    fy: 913.999
+    cx: 640.0
+    cy: 360.0
 ocr:
-  # Florence2環境のPython。ROS側とは別プロセスで起動。
   python: ~/florence2_work/.venv/bin/python
   script: ~/florence2_work/florence2_ocr.py
   device: auto
-  # 空ならflorence2_ocr.pyのデフォルトモデルを使用。
   model: ''
   timeout: 300.0
 follow_action: /follow_waypoints
@@ -29,9 +42,60 @@ navigate_action: /navigate_to_pose
 spin_action: /spin
 next_file_service: /waypoint_sender_node/next_file
 costmap_nodes:
-  - /local_costmap/local_costmap
-  - /global_costmap/global_costmap
+- /local_costmap/local_costmap
+- /global_costmap/global_costmap
 settle_seconds: 0.5
 spin_time_allowance: 45.0
 service_timeout: 10.0
 cancel_timeout: 15.0
+detector:
+  python: ~/florence2_work/.venv/bin/python
+  script: ~/florence2_work/florence2_phrase.py
+  model: ''
+  device: auto
+  text: A blue plastic storage box.
+  timeout: 300.0
+  blue_filter: true
+  blue_hsv_lower:
+  - 90
+  - 60
+  - 30
+  blue_hsv_upper:
+  - 135
+  - 255
+  - 255
+  min_blue_fraction: 0.08
+approach:
+  cmd_vel_topic: /box_mission/cmd_vel
+  odom_topic: /odometry/filtered
+  monitor_output_topic: /cmd_vel
+  gate_service: /box_command_gate/mission_control
+  gate_status_topic: /box_command_gate/status
+  monitor_node: /collision_monitor
+  front_stop_parameter: FrontStop.enabled
+  box_height_m: 0.31
+  camera_forward_m: 0.4
+  robot_front_m: 0.6
+  stand_off_m: 0.3
+  min_distance_m: 0.3
+  max_distance_m: 25.0
+  min_bbox_height_px: 8.0
+  edge_margin_px: 2.0
+  speed_mps: 0.15
+  max_speed_mps: 0.3
+  max_total_travel_m: 25.0
+  final_extra_m: 0.8
+  max_drive_seconds: 180.0
+  odom_timeout: 0.7
+  monitor_timeout: 0.7
+  stall_seconds: 5.0
+  output_grace_seconds: 0.6
+  stop_hold_seconds: 0.25
+  stop_settle_seconds: 0.6
+  max_cross_track_m: 0.15
+  max_heading_error_deg: 10.0
+  max_odom_step_m: 0.5
+  angular_tolerance_deg: 2.0
+  max_turn_step_deg: 20.0
+  max_align_iterations: 5
+  stop_timeout_seconds: 5.0

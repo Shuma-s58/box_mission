@@ -25,9 +25,11 @@ from std_srvs.srv import Trigger
 from std_msgs.msg import String
 
 from mission_logic import CommandHeading, classify_regions
+from visual_approach import VisualApproach
+from approach_logic import planned_travel
 
 
-class Mission(Node):
+class Mission(VisualApproach, Node):
     def __init__(self, config_path):
         config_path = Path(config_path).expanduser().resolve()
         self.config_dir = config_path.parent
@@ -45,9 +47,6 @@ class Mission(Node):
         self.layer_clients = {}
         self.images = []
         self.ocr_process = None
-        self.initial_remaining = None
-        self.remaining = None
-        self.halfway = False
         self.last_wp = None
         self.follow = ActionClient(self, FollowWaypoints, self.cfg.get('follow_action', '/follow_waypoints'))
         self.navigate = ActionClient(self, NavigateToPose, self.cfg.get('navigate_action', '/navigate_to_pose'))
@@ -61,6 +60,7 @@ class Mission(Node):
         spec = importlib.util.spec_from_file_location('mission_box_hooks', hook_path)
         self.hooks = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.hooks)
+        self.setup_visual()
 
     def path(self, value):
         path = Path(str(value)).expanduser()
@@ -91,7 +91,8 @@ class Mission(Node):
 
     def context(self):
         return {'frame_id': self.frame, 'command_deg': self.heading.degrees,
-                'image_dir': str(self.run_dir), 'images': list(self.images)}
+                'image_dir': str(self.run_dir), 'images': list(self.images),
+                'detect': self.detect_boxes, 'approach': self.ap}
 
     def confirm_callback(self, request, response):
         if self.state != 'WAIT_CONFIRM':
@@ -100,7 +101,7 @@ class Mission(Node):
         else:
             self.confirmed = True
             response.success = True
-            response.message = '到達確認を受理。走行キャンセル後に逆回転・レイヤー復帰・next_fileを行います。'
+            response.message = '到達確認を受理。停止を維持し、逆回転・レイヤー復帰・next_fileを行います。'
         return response
 
     def pose(self, point):
@@ -161,7 +162,7 @@ class Mission(Node):
         self.result_future = None
         self.settle()
 
-    def rotate(self, degrees):
+    def _rotate_action(self, degrees):
         degrees = float(degrees)
         if abs(degrees) < 1e-8:
             return
@@ -176,13 +177,42 @@ class Mission(Node):
         self.heading.commit(degrees)
         self.settle()
 
+    def rotate(self, degrees):
+        if abs(float(degrees)) < 1e-8:
+            return
+        self.stop_direct()
+        if self.direct_owned:
+            self.set_direct(False)
+        # 箱の手前の前進停止領域は、角速度のみのSpinでは外す。
+        # 内側の車体保護領域とCollision Monitor自体は有効のまま。
+        self.front_stop(False)
+        try:
+            self._rotate_action(degrees)
+        finally:
+            self.front_stop(True)
+
+    def front_stop(self, enabled):
+        node = self.ap['monitor_node'].rstrip('/')
+        name = self.ap['front_stop_parameter']
+        client = self.create_client(SetParameters, node+'/set_parameters')
+        try:
+            timeout = float(self.cfg['service_timeout'])
+            if not client.wait_for_service(timeout_sec=timeout):
+                raise RuntimeError('Collision Monitorのパラメータサービスがありません。')
+            req = SetParameters.Request()
+            req.parameters = [ParameterMsg(name=name, value=ParameterValue(
+                type=ParameterType.PARAMETER_BOOL, bool_value=bool(enabled)))]
+            res = self.wait_future(client.call_async(req), timeout)
+            if len(res.results) != 1 or not res.results[0].successful:
+                raise RuntimeError('前方停止領域の切替失敗')
+        finally:
+            self.destroy_client(client)
+
     def face_command(self, target):
         self.rotate(self.heading.delta_to(target))
 
-    def capture(self, label):
-        # 毎回開き直し、回転前にバッファされたフレームを使わない。
-        self.settle()
-        camera_cfg = self.cfg.get('camera', {})
+    def capture_usb(self):
+        camera_cfg = self.cfg['camera']
         device = camera_cfg.get('device', '/dev/video0')
         cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
         try:
@@ -200,15 +230,24 @@ class Mission(Node):
             ok, frame = cap.read()
             if not ok or frame is None:
                 raise RuntimeError('写真撮影に失敗しました。')
-            path = self.run_dir / f'{len(self.images):02d}_{label}.png'
-            if not cv2.imwrite(str(path), frame):
-                raise RuntimeError(f'画像保存に失敗しました: {path}')
         finally:
             cap.release()
-        record = {'path': str(path), 'command_deg': self.heading.degrees}
+        return frame
+
+    def capture(self, label):
+        self.settle()
+        if self.cfg['camera']['source'] == 'ros':
+            frame, stamp = self.capture_ros()
+        else:
+            frame, stamp = self.capture_usb(), {'clock': 'host_capture'}
+        path = self.run_dir / f'{len(self.images):02d}_{label}.png'
+        if not cv2.imwrite(str(path), frame):
+            raise RuntimeError(f'画像保存に失敗: {path}')
+        record = {'path': str(path), 'command_deg': self.heading.degrees,
+                  'stamp': stamp, 'intrinsics': self.intrinsics(frame.shape[1], frame.shape[0])}
         self.images.append(record)
-        (self.run_dir / 'images.json').write_text(json.dumps(self.images, indent=2), encoding='utf-8')
-        self.get_logger().info(f'Captured: {path}, command={self.heading.degrees:+.1f} deg')
+        (self.run_dir/'images.json').write_text(json.dumps(self.images, indent=2), encoding='utf-8')
+        self.get_logger().info(f'Captured: {path}, command={self.heading.degrees:+.1f}')
         return record
 
     def ocr(self, record):
@@ -265,72 +304,11 @@ class Mission(Node):
         for node in self.cfg.get('costmap_nodes', ['/local_costmap/local_costmap', '/global_costmap/global_costmap']):
             self.layer_call(node.rstrip('/'), enabled)
 
-    def nav_feedback(self, message):
-        value = float(message.feedback.distance_remaining)
-        if not math.isfinite(value) or value < 0:
-            return
-        self.remaining = value
-        if self.initial_remaining is None and value > 0.05:
-            self.initial_remaining = value
-            self.get_logger().info(f'接近の初期残り経路長: {value:.2f} m')
-        if self.initial_remaining is not None and value <= self.initial_remaining * 0.5:
-            self.halfway = True
-
     def wp_feedback(self, message):
         index = message.feedback.current_waypoint
         if index != self.last_wp:
             self.last_wp = index
             self.get_logger().info(f'Current waypoint: {index} (0-based)')
-
-    def approach_halfway(self, point):
-        self.initial_remaining = None
-        self.remaining = None
-        self.halfway = False
-        goal = NavigateToPose.Goal()
-        goal.pose = self.pose(point)
-        self.start_action(self.navigate, goal, self.nav_feedback)
-        while not self.halfway:
-            if self.result_future.done():
-                raise RuntimeError('半分の地点を確認する前に接近Actionが終了しました。')
-            self.pump()
-        self.cancel_action()
-
-    def midway_check(self):
-        center = self.capture('midway_center')
-        if self.hooks.box_visible(center['path'], self.context()):
-            return
-        base = self.heading.degrees
-        self.rotate(10.0)
-        left = self.capture('midway_left10')
-        self.rotate(-20.0)
-        right = self.capture('midway_right10')
-        selected = self.hooks.choose_box_image([left, right], self.context())
-        if selected is None:
-            raise RuntimeError('途中の左右10度の写真にもboxが写っていません。')
-        if selected not in (left, right):
-            raise ValueError('box判定は渡された写真から選択してください。')
-        # 調整角度は撮影時の指令値。実測姿勢は使わない。
-        self.face_command(selected['command_deg'])
-        self.get_logger().info(f'途中修正: 基準{base:+.1f} -> {self.heading.degrees:+.1f} deg')
-
-    def wait_arrival(self, point):
-        self.confirmed = False
-        self.layers(False)
-        goal = NavigateToPose.Goal()
-        goal.pose = self.pose(point)
-        self.start_action(self.navigate, goal)
-        self.set_state('WAIT_CONFIRM')
-        self.get_logger().info('box付近で停止したことを人が確認して /box_mission/confirm_arrival を呼んでください。')
-        reported = False
-        while not self.confirmed:
-            if self.result_future.done() and not reported:
-                wrapped = self.result_future.result()
-                self.get_logger().warn(
-                    f'接近Action終了 status={wrapped.status}。自動で到達認定せず、人の確認を待ちます。')
-                reported = True
-            self.pump()
-        self.set_state('CONFIRMED')
-        self.cancel_action()
 
     def preflight(self):
         route_dir = self.path(self.cfg['route_dir'])
@@ -355,6 +333,21 @@ class Mission(Node):
                 raise RuntimeError('Nav2 Actionサーバーが利用できません。')
         if not self.next_client.wait_for_service(timeout_sec=float(self.cfg.get('service_timeout', 10.0))):
             raise RuntimeError('waypoint_sender_node/next_fileサービスが利用できません。')
+        if not self.path(self.cfg['detector']['script']).is_file():
+            raise ValueError('detector.scriptが見つかりません。')
+        self.check_monitor()
+        self.wait_condition(lambda: self.gate_status is not None and self.gate_status.get('scan_ok')
+                            and time.monotonic()-self.gate_received < float(self.ap['monitor_timeout']),
+                            self.cfg['service_timeout'], 'box_command_gate/low_scanが準備できません。')
+        if self.gate_status['owner'] != 'nav':
+            raise RuntimeError('ゲートがmission所有のままです。前回の停止理由を確認して解除してください。')
+        self.wait_condition(lambda: self.odom is not None and time.monotonic()-self.odom_received < float(self.ap['odom_timeout']),
+                            self.cfg['service_timeout'], 'オドメトリがありません。')
+        publishers = self.get_publishers_info_by_topic(self.ap['monitor_output_topic'])
+        expected = self.ap['monitor_node'].rstrip('/').split('/')[-1]
+        if len(publishers) != 1 or publishers[0].node_name != expected:
+            raise RuntimeError('最終速度トピックのpublisherはCollision Monitorだけにしてください。')
+        self.front_stop(True)
         return route_dir, data['goal']
 
     def run(self):
@@ -388,18 +381,28 @@ class Mission(Node):
             raise RuntimeError('6枚の写真にboxが写っていません。')
         if selected not in records:
             raise ValueError('box選択は渡された6枚から選択してください。')
-        self.face_command(self.hooks.target_command_heading(selected, self.context()))
-        point = self.hooks.box_goal(selected, self.context())
-        self.pose(point)
-        self.set_state('APPROACH_HALF')
+        self.set_state('ALIGN_BOX')
+        aligned = self.align_box(selected)
+        distance = self.hooks.box_distance(aligned, self.context())
+        length = planned_travel(distance, self.ap)
+        self.get_logger().info(f'画像距離={distance:.3f} m / 予定接近={length:.3f} m / 半分={length/2:.3f} m')
         self.layers(False)
-        self.approach_halfway(point)
-        self.set_state('MIDWAY_CAPTURE')
-        self.midway_check()
-        self.wait_arrival(point)
+        result = self.approach_halfway(length)
+        if result == 'halfway':
+            self.set_state('MIDWAY_CAPTURE')
+            aligned = self.midway_check()
+            distance = self.hooks.box_distance(aligned, self.context())
+            remaining = planned_travel(distance, self.ap) + float(self.ap['final_extra_m'])
+            remaining = min(remaining, float(self.ap['max_total_travel_m'])-self.total_travel)
+            self.drive_straight(remaining, final=True)
+        else:
+            self.get_logger().warn('半分地点より前に停止。途中撮影を省略して人の確認を待ちます。')
+        self.wait_arrival()
         self.set_state('RETURN_HEADING')
         # 並進やNav2自身の旋回は角度計算に含めず、指令の累積を逆回転する。
         self.face_command(0.0)
+        if self.direct_owned:
+            self.set_direct(False)
         self.layers(True)
         self.set_state('NEXT_FILE')
         reply = self.wait_future(self.next_client.call_async(Trigger.Request()), self.cfg.get('service_timeout', 10.0))
@@ -418,9 +421,18 @@ class Mission(Node):
                 self.ocr_process.wait()
         errors = []
         try:
+            self.stop_direct()
+        except Exception as error:
+            errors.append(f'直進停止失敗: {error}')
+        try:
             self.cancel_action()
         except Exception as error:
             errors.append(f'キャンセル失敗: {error}')
+        try:
+            self.front_stop(True)
+        except Exception as error:
+            errors.append(f'前方停止領域の復帰失敗: {error}')
+        # 異常終了時はゲート所有権を自動解放せず、古いNav2指令への復帰を防ぐ。
         # 変更途中に片方のcostmapだけ失敗した場合も、変更前の値へ戻す。
         for node, original in list(self.original_layers.items()):
             try:
