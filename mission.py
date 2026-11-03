@@ -40,7 +40,7 @@ class Mission(VisualApproach, Node):
         self.heading = CommandHeading()
         self.state = 'STARTING'
         self.confirmed = False
-        self.handle = None
+        self.action_goal_handle = None
         self.result_future = None
         self.pending_goal = None
         self.original_layers = {}
@@ -89,7 +89,7 @@ class Mission(VisualApproach, Node):
         while time.monotonic() < deadline:
             self.pump()
 
-    def context(self):
+    def hook_context(self):
         return {'frame_id': self.frame, 'command_deg': self.heading.degrees,
                 'image_dir': str(self.run_dir), 'images': list(self.images),
                 'detect': self.detect_boxes, 'approach': self.ap}
@@ -125,40 +125,40 @@ class Mission(VisualApproach, Node):
         return [self.pose(point) for point in points]
 
     def start_action(self, client, goal, feedback=None):
-        if self.handle is not None:
+        if self.action_goal_handle is not None:
             raise RuntimeError('このノードのActionがまだ実行中です。')
         self.pending_goal = client.send_goal_async(goal, feedback_callback=feedback)
         handle = self.wait_future(self.pending_goal, self.cfg.get('service_timeout', 10.0))
         self.pending_goal = None
         if handle is None or not handle.accepted:
             raise RuntimeError('Nav2がゴールを拒否しました。')
-        self.handle = handle
+        self.action_goal_handle = handle
         self.result_future = handle.get_result_async()
         self.get_logger().info(f'Accepted goal_id={bytes(handle.goal_id.uuid).hex()}')
 
     def finish_action(self):
         result = self.wait_future(self.result_future)
-        self.handle = None
+        self.action_goal_handle = None
         self.result_future = None
         if result.status != GoalStatus.STATUS_SUCCEEDED:
             raise RuntimeError(f'Nav2 Actionが正常終了しませんでした: status={result.status}')
         return result.result
 
     def cancel_action(self):
-        if self.handle is None and self.pending_goal is not None:
+        if self.action_goal_handle is None and self.pending_goal is not None:
             handle = self.wait_future(self.pending_goal, self.cfg.get('service_timeout', 10.0))
             self.pending_goal = None
             if handle is not None and handle.accepted:
-                self.handle = handle
+                self.action_goal_handle = handle
                 self.result_future = handle.get_result_async()
-        if self.handle is None:
+        if self.action_goal_handle is None:
             return
         if not self.result_future.done():
-            reply = self.wait_future(self.handle.cancel_goal_async(), self.cfg.get('service_timeout', 10.0))
+            reply = self.wait_future(self.action_goal_handle.cancel_goal_async(), self.cfg.get('service_timeout', 10.0))
             if not reply.goals_canceling and not self.result_future.done():
                 raise RuntimeError('Actionのキャンセルが拒否されました。')
         self.wait_future(self.result_future, self.cfg.get('cancel_timeout', 15.0))
-        self.handle = None
+        self.action_goal_handle = None
         self.result_future = None
         self.settle()
 
@@ -253,7 +253,7 @@ class Mission(VisualApproach, Node):
     def ocr(self, record):
         cfg = self.cfg['ocr']
         result_path = self.run_dir / 'ocr_result.json'
-        cmd = [str(self.path(cfg['python'])) if '/' in str(cfg['python']) else str(cfg['python']),
+        cmd = [self.python_path(cfg['python']) if '/' in str(cfg['python']) else str(cfg['python']),
                str(self.path(cfg['script'])), record['path'],
                '--json', str(result_path), '-o', str(self.run_dir / 'ocr_annotated.png'),
                '--device', str(cfg.get('device', 'auto'))]
@@ -376,14 +376,14 @@ class Mission(VisualApproach, Node):
             records.append(self.capture(f'search_{index}'))
             if index < 5:
                 self.rotate(15.0)
-        selected = self.hooks.choose_box_image(records, self.context())
+        selected = self.hooks.choose_box_image(records, self.hook_context())
         if selected is None:
             raise RuntimeError('6枚の写真にboxが写っていません。')
         if selected not in records:
             raise ValueError('box選択は渡された6枚から選択してください。')
         self.set_state('ALIGN_BOX')
         aligned = self.align_box(selected)
-        distance = self.hooks.box_distance(aligned, self.context())
+        distance = self.hooks.box_distance(aligned, self.hook_context())
         length = planned_travel(distance, self.ap)
         self.get_logger().info(f'画像距離={distance:.3f} m / 予定接近={length:.3f} m / 半分={length/2:.3f} m')
         self.layers(False)
@@ -391,7 +391,7 @@ class Mission(VisualApproach, Node):
         if result == 'halfway':
             self.set_state('MIDWAY_CAPTURE')
             aligned = self.midway_check()
-            distance = self.hooks.box_distance(aligned, self.context())
+            distance = self.hooks.box_distance(aligned, self.hook_context())
             remaining = planned_travel(distance, self.ap) + float(self.ap['final_extra_m'])
             remaining = min(remaining, float(self.ap['max_total_travel_m'])-self.total_travel)
             self.drive_straight(remaining, final=True)
@@ -442,6 +442,12 @@ class Mission(VisualApproach, Node):
         for error in errors:
             self.get_logger().error(error)
         return errors
+
+    def python_path(self, value):
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute():
+            path = self.config_dir / path
+        return str(path.absolute())
 
 
 def main():

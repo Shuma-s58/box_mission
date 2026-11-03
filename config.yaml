@@ -32,15 +32,15 @@ camera:
     cx: 640.0
     cy: 360.0
 ocr:
-  python: ~/florence2_work/.venv/bin/python
-  script: ~/florence2_work/florence2_ocr.py
+  python: /home/ros/florence2_work/.venv/bin/python
+  script: /home/ros/florence2_work/florence2_ocr.py
   device: auto
-  model: '~/florence2_work/Florence2-base'
+  model: '/home/ros/florence2_work/Florence2-base'
   timeout: 300.0
 follow_action: /follow_waypoints
 navigate_action: /navigate_to_pose
 spin_action: /spin
-next_file_service: /waypoint_sender_node/next_file
+next_file_service: /waypoint_sender_node/next_yaml
 costmap_nodes:
 - /local_costmap/local_costmap
 - /global_costmap/global_costmap
@@ -49,9 +49,9 @@ spin_time_allowance: 45.0
 service_timeout: 10.0
 cancel_timeout: 15.0
 detector:
-  python: ~/florence2_work/.venv/bin/python
-  script: ~/florence2_work/florence2_phrase.py
-  model: '~/florence2_work/Florence2-base'
+  python: /home/ros/florence2_work/.venv/bin/python
+  script: /home/ros/florence2_work/florence2_phrase.py
+  model: '/home/ros/florence2_work/Florence2-base'
   device: auto
   text: A blue plastic storage box.
   timeout: 300.0

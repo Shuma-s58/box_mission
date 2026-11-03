@@ -178,7 +178,7 @@ class VisualApproach:
         cfg = self.cfg['detector']
         image = Path(image_path)
         result = image.with_suffix('.boxes.json')
-        cmd = [str(self.path(cfg['python'])) if '/' in cfg['python'] else cfg['python'],
+        cmd = [self.python_path(cfg['python']) if '/' in cfg['python'] else cfg['python'],
                str(self.path(cfg['script'])), str(image), '--json', str(result),
                '-o', str(image.with_suffix('.boxes.png')), '--device', cfg['device'], '--text', cfg['text']]
         if cfg.get('model'):
@@ -226,7 +226,7 @@ class VisualApproach:
         self.face_command(float(selected['command_deg']))
         for attempt in range(int(self.ap['max_align_iterations'])+1):
             record = self.capture(f'align_{len(self.images)}')
-            obs = self.hooks.box_observation(record, self.context())
+            obs = self.hooks.box_observation(record, self.hook_context())
             angle = float(obs['bearing_deg'])
             if abs(angle) <= float(self.ap['angular_tolerance_deg']):
                 return record
@@ -300,14 +300,14 @@ class VisualApproach:
 
     def midway_check(self):
         center = self.capture('midway_center')
-        if self.hooks.box_visible(center['path'], self.context()):
+        if self.hooks.box_visible(center['path'], self.hook_context()):
             return self.align_box(center)
         base = self.heading.degrees
         self.rotate(10.)
         left = self.capture('midway_left10')
         self.rotate(-20.)
         right = self.capture('midway_right10')
-        selected = self.hooks.choose_box_image([left, right], self.context())
+        selected = self.hooks.choose_box_image([left, right], self.hook_context())
         if selected is None:
             raise RuntimeError('途中の左右10度でも箱が見つかりません。')
         self.get_logger().info(f'途中探索の基準指令角度: {base:.1f}')
